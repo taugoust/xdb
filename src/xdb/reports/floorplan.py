@@ -194,35 +194,35 @@ set sites [get_sites -quiet]
 set site_names [get_property NAME $sites]
 set site_types [get_property SITE_TYPE $sites]
 # Physical tile coordinates instead of RPM grid — matches Vivado Device View
-# geometry. get_tiles -of_objects preserves the order of the input list, so
-# a single bulk call gives us tile-per-site cheaply.
-set site_tile_objs [get_tiles -of_objects $sites -quiet]
-if {[llength $site_tile_objs] == [llength $sites]} {
-    set site_xs [get_property COLUMN $site_tile_objs]
-    set site_ys [get_property ROW    $site_tile_objs]
-} else {
-    # Fallback: rebuild via per-tile lookup.
-    set all_tiles [get_tiles -quiet]
-    array set tc {}
-    array set tr {}
-    foreach n [get_property NAME $all_tiles] c [get_property COLUMN $all_tiles] r [get_property ROW $all_tiles] {
-        set tc($n) $c
-        set tr($n) $r
-    }
-    set site_xs [list]
-    set site_ys [list]
-    foreach s $sites {
-        set t [lindex [get_tiles -of_objects $s -quiet] 0]
-        if {$t ne "" && [info exists tc([get_property NAME $t])]} {
-            lappend site_xs $tc([get_property NAME $t])
-            lappend site_ys $tr([get_property NAME $t])
-        } else {
-            lappend site_xs ""
-            lappend site_ys ""
+# geometry. Prior version used a single bulk `get_tiles -of_objects $sites`
+# and relied on element-wise ordering, which Vivado does NOT guarantee: with
+# duplicate or reordered tiles the returned list mis-aligns with $sites and
+# every SLICE ends up stamped with some other site's tile coords, wrecking
+# per-vFPGA bboxes. Correct approach: build a tile-name -> (col,row) lookup
+# once, then per-site fetch the containing tile's NAME.
+set all_tiles [get_tiles -quiet]
+array set tc {}
+array set tr {}
+foreach n [get_property NAME $all_tiles] c [get_property COLUMN $all_tiles] r [get_property ROW $all_tiles] {
+    set tc($n) $c
+    set tr($n) $r
+}
+set site_xs [list]
+set site_ys [list]
+foreach s $sites {
+    set t [lindex [get_tiles -of_objects $s -quiet] 0]
+    if {$t ne ""} {
+        set tn [get_property NAME $t]
+        if {[info exists tc($tn)]} {
+            lappend site_xs $tc($tn)
+            lappend site_ys $tr($tn)
+            continue
         }
     }
-    unset tc tr
+    lappend site_xs ""
+    lappend site_ys ""
 }
+unset tc tr
 set coordinate_count 0
 set missing_coordinate_count 0
 foreach site $sites name $site_names type $site_types x $site_xs y $site_ys {
@@ -937,7 +937,7 @@ def _svg_document(
         "    .legend-label { font-size: 13px; }",
         "    .hierarchy-name { font-size: 13px; font-weight: 600; }",
         f"    .legend-detail {{ font-size: 12px; fill: {_THEME['ink_dim']}; }}",
-        f"    .pblock-label {{ font-size: 11px; font-weight: 600; fill: {_THEME['pblock_label']}; }}",
+        # (.pblock-label CSS removed — dashed pblock-outline overlay no longer emitted)
         "  </style>",
         f'  <rect width="{_fmt(document_width)}" height="{_fmt(document_height)}" fill="{_THEME["document_bg"]}"/>',
         (
@@ -961,6 +961,24 @@ def _svg_document(
         lines.append(
             f'    <path d="{path}" fill="#3a3f47" opacity="0.55"/>'
         )
+    lines.append("  </g>")
+
+    # Distinct pass for hard-IP tiles (GTY/CMAC/HBM/PCIe/NOC) so the reader
+    # can see WHERE user code is off-limits — this is what makes the leftmost
+    # vFPGA-carveouts (pblocks 4/5/6) legible instead of unexplained gaps.
+    # Uses the palette's own transceiver/hard colors at higher opacity so
+    # they stand out against the muted grey background.
+    lines.append('  <g id="hard-ip-tiles">')
+    for resource_key, palette_key in (("transceiver", "transceiver"), ("hard", "hard")):
+        pts = background_points.get(resource_key)
+        if not pts:
+            continue
+        mw, mh = _MARK_SIZE[resource_key]
+        fill = _RESOURCE_COLORS[palette_key]
+        for path, _count in _mark_path_chunks(pts, mw, mh):
+            lines.append(
+                f'    <path d="{path}" fill="{fill}" opacity="0.9"/>'
+            )
     lines.append("  </g>")
 
     lines.append('  <g id="placed-hierarchies">')
@@ -987,43 +1005,304 @@ def _svg_document(
     lines.append("  </g>")
 
     # Outlined bounding boxes + inline labels for the vFPGA wrappers.
+    # Prefer the XDC-declared pblock bounds for each inst_user_wrapper_N over
+    # the cell-derived bbox: with strict-pblock DFX, ~99% of cells end up inside
+    # the pblock, but phys_opt replicas / global-buffer neighbors / stray
+    # LUTRAM cells outside stretch the raw bbox across nearly the whole die
+    # and hide the physical isolation the paper is trying to show. Fall back
+    # to the cell-derived bbox only if the wrapper has no matching pblock.
     import re as _re
     _INTERESTING_RE = _re.compile(r"^inst_user_wrapper_(\d+)$")
+    _PBLOCK_RE      = _re.compile(r"^pblock_inst_user_wrapper_(\d+)$")
     lines.append('  <g id="hierarchy-bboxes">')
+
+    # Use ONLY the pblock's SLICE-derived rectangles for the outline. URAM/BRAM/
+    # DSP ranges snap to slightly different tile ROWs than SLICE, so mixing all
+    # resource rects makes adjacent bands overlap 15-20% even though their
+    # SLICE bands don't. The SLICE rectangle is what a paper reader reads as
+    # "the vFPGA's physical region."
+    pblock_bbox_by_idx: dict[int, tuple[float, float, float, float]] = {}
+    for pblock, _raw_regions, _stroke in pblock_regions:
+        m = _PBLOCK_RE.match(pblock.name)
+        if not m:
+            continue
+        slice_rects_raw = [
+            item for item in pblock.ranges
+            if ":" in item and item.startswith("SLICE_")
+        ]
+        transformed: list[tuple[float, float, float, float]] = []
+        for item in slice_rects_raw:
+            first_name, second_name = item.split(":", 1)
+            first = design.sites.get(first_name)
+            second = design.sites.get(second_name)
+            if first is None or second is None:
+                continue
+            rx0 = float(min(first.x, second.x))
+            ry0 = float(min(first.y, second.y))
+            rx1 = float(max(first.x, second.x))
+            ry1 = float(max(first.y, second.y))
+            sx0 = left + (rx0 - min_x) * scale
+            sx1 = left + (rx1 - min_x) * scale
+            # Y is inverted: max_y - device_y
+            sy0 = top + (max_y - ry1) * scale
+            sy1 = top + (max_y - ry0) * scale
+            transformed.append((sx0, sy0, sx1, sy1))
+        if not transformed:
+            continue
+        gx0 = min(r[0] for r in transformed)
+        gy0 = min(r[1] for r in transformed)
+        gx1 = max(r[2] for r in transformed)
+        gy1 = max(r[3] for r in transformed)
+        pblock_bbox_by_idx[int(m.group(1))] = (gx0, gy0, gx1, gy1)
+
     # First pass: compute bboxes for all vFPGA groups, sorted numerically.
     vfpga_entries = []
     for group, (gx0, gy0, gx1, gy1) in group_bboxes.items():
         m = _INTERESTING_RE.match(group)
         if not m:
             continue
-        vfpga_entries.append((int(m.group(1)), group, gx0, gy0, gx1, gy1))
+        idx = int(m.group(1))
+        pb = pblock_bbox_by_idx.get(idx)
+        if pb is not None:
+            gx0, gy0, gx1, gy1 = pb
+        vfpga_entries.append((idx, group, gx0, gy0, gx1, gy1))
     vfpga_entries.sort()
-    # Draw all rects first — heavier strokes so bboxes read at figure scale.
-    for _idx, group, gx0, gy0, gx1, gy1 in vfpga_entries:
-        color = color_by_group[group]
-        pad = 4.0
-        rx = gx0 - pad
-        ry = gy0 - pad
-        rw = (gx1 - gx0) + 2 * pad
-        rh = (gy1 - gy0) + 2 * pad
+
+    # Colored bbox OUTLINES per vFPGA — drawn first so labels sit on top. No
+    # pad: adjacent pblocks share exact SLICE_Y boundaries and any pad would
+    # introduce a fake ~8px overlap at every band boundary.
+    def _draw_outline(x0: float, y0: float, x1: float, y1: float, color: str, tooltip: str) -> None:
         lines.append(
-            f'    <rect x="{_fmt(rx)}" y="{_fmt(ry)}" width="{_fmt(rw)}" height="{_fmt(rh)}" '
+            f'    <rect x="{_fmt(x0)}" y="{_fmt(y0)}" '
+            f'width="{_fmt(x1 - x0)}" height="{_fmt(y1 - y0)}" '
             f'fill="none" stroke="{color}" stroke-width="4.5" opacity="0.95" rx="3">'
-            f'<title>{xml_escape(group)}</title></rect>'
+            f'<title>{xml_escape(tooltip)}</title></rect>'
         )
-    # Anchor each vFPGA's label at the top-left corner of its bbox, but if a
-    # tag would overlap a previously-placed one, push it downward.
+
+    for _idx, group, gx0, gy0, gx1, gy1 in vfpga_entries:
+        _draw_outline(gx0, gy0, gx1, gy1, color_by_group[group], group)
+
+    # Additional outlines for shell / static / hard-IP regions — same visual
+    # style as vFPGA outlines, so the reader gets a labeled box for every
+    # region on the die instead of a separate top-right legend.
     LABEL_H = 32.0
     LABEL_FONT_SIZE = 18
     LABEL_CHAR_W = 11.0
     LABEL_PAD_X = 10.0
     placed_labels: list[tuple[float, float, float, float]] = []
-    for idx, group, gx0, gy0, gx1, gy1 in vfpga_entries:
-        color = color_by_group[group]
-        label = f"vFPGA {idx}"
+    label_entries: list[tuple[str, str, float, float]] = []  # (color, label, lx, ly)
+
+    for idx, group, gx0, gy0, _gx1, _gy1 in vfpga_entries:
+        label_entries.append((color_by_group[group], f"vFPGA {idx}", gx0, gy0))
+
+    # 2D gap-based clustering: split rects (or points-as-tiny-rects) into
+    # spatially disjoint groups. Two rects merge if the distance between
+    # their AABBs is ≤ gap_x on X *and* ≤ gap_y on Y. Separate axis gaps
+    # matter for hard-IP tiles that form long horizontal rows (HBM/PCIe/
+    # CMAC along the bottom of U280) — a big gap_x bridges the row while a
+    # small gap_y keeps the row separate from mid-column CIPS/CONFIG tiles.
+    # Simple union-find pass — O(N^2), fine for the O(100) rects we get.
+    def _cluster_rects(
+        rects: list[tuple[float, float, float, float]],
+        gap: float | None = None,
+        gap_x: float | None = None,
+        gap_y: float | None = None,
+    ) -> list[tuple[float, float, float, float]]:
+        if gap_x is None:
+            gap_x = gap if gap is not None else 0.0
+        if gap_y is None:
+            gap_y = gap if gap is not None else 0.0
+        if not rects:
+            return []
+        n = len(rects)
+        parent = list(range(n))
+        def _find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        def _union(i: int, j: int) -> None:
+            ri, rj = _find(i), _find(j)
+            if ri != rj:
+                parent[ri] = rj
+        for i in range(n):
+            ix0, iy0, ix1, iy1 = rects[i]
+            for j in range(i + 1, n):
+                jx0, jy0, jx1, jy1 = rects[j]
+                dx = max(0.0, max(ix0 - jx1, jx0 - ix1))
+                dy = max(0.0, max(iy0 - jy1, jy0 - iy1))
+                if dx <= gap_x and dy <= gap_y:
+                    _union(i, j)
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            groups.setdefault(_find(i), []).append(i)
+        unions: list[tuple[float, float, float, float, int]] = []
+        for members in groups.values():
+            xs0 = [rects[i][0] for i in members]
+            ys0 = [rects[i][1] for i in members]
+            xs1 = [rects[i][2] for i in members]
+            ys1 = [rects[i][3] for i in members]
+            unions.append((min(xs0), min(ys0), max(xs1), max(ys1), len(members)))
+        # Strip the member-count from the return type to keep the public
+        # signature stable; the count is used only inside this function for
+        # optional filtering by callers who care about cluster size.
+        return [(a, b, c, d) for a, b, c, d, _n in unions]
+
+    def _cluster_rects_sized(
+        rects: list[tuple[float, float, float, float]],
+        gap_x: float,
+        gap_y: float,
+    ) -> list[tuple[float, float, float, float, int]]:
+        """Same as _cluster_rects but returns cluster member count too."""
+        if not rects:
+            return []
+        n = len(rects)
+        parent = list(range(n))
+        def _find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        for i in range(n):
+            ix0, iy0, ix1, iy1 = rects[i]
+            for j in range(i + 1, n):
+                jx0, jy0, jx1, jy1 = rects[j]
+                dx = max(0.0, max(ix0 - jx1, jx0 - ix1))
+                dy = max(0.0, max(iy0 - jy1, jy0 - iy1))
+                if dx <= gap_x and dy <= gap_y:
+                    ri, rj = _find(i), _find(j)
+                    if ri != rj:
+                        parent[ri] = rj
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            groups.setdefault(_find(i), []).append(i)
+        out: list[tuple[float, float, float, float, int]] = []
+        for members in groups.values():
+            xs0 = [rects[i][0] for i in members]
+            ys0 = [rects[i][1] for i in members]
+            xs1 = [rects[i][2] for i in members]
+            ys1 = [rects[i][3] for i in members]
+            out.append((min(xs0), min(ys0), max(xs1), max(ys1), len(members)))
+        return out
+
+    def _label_pos_for(
+        bboxes: list[tuple[float, float, float, float]],
+        prefer: str = "largest",
+    ) -> tuple[float, float] | None:
+        """Return an anchor point (top-left) for a label chip.
+
+        prefer='largest'   → largest bbox (by area)
+        prefer='leftmost'  → bbox containing the smallest x (for GTY on U280,
+                             where QSFP CMAC lives at the left edge and any
+                             mystery right-side GTY sites are not what a
+                             reader means by "CMAC's transceivers")
+        """
+        if not bboxes:
+            return None
+        if prefer == "leftmost":
+            chosen = min(bboxes, key=lambda b: b[0])
+        else:
+            chosen = max(bboxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+        return (chosen[0], chosen[1])
+
+    # -- Shell: pblock_inst_shell tessellates each SLR-strip into many small
+    # rects; merge adjacent ones so we draw one clean outline per SLR strip.
+    shell_color = color_by_group.get("inst_shell")
+    if shell_color is not None:
+        shell_svg_rects: list[tuple[float, float, float, float]] = []
+        for pblock, raw_regions, _ in pblock_regions:
+            if pblock.name != "pblock_inst_shell":
+                continue
+            for rx0, ry0, rx1, ry1 in raw_regions:
+                sx0 = left + (rx0 - min_x) * scale
+                sx1 = left + (rx1 - min_x) * scale
+                sy0 = top + (max_y - ry1) * scale
+                sy1 = top + (max_y - ry0) * scale
+                shell_svg_rects.append((sx0, sy0, sx1, sy1))
+        # 8px gap ≈ 2 tile widths — merges strips within the same SLR band
+        # but keeps the top/mid/bot SLR strips separate.
+        shell_unions = _cluster_rects(shell_svg_rects, gap=8.0)
+        for sx0, sy0, sx1, sy1 in shell_unions:
+            _draw_outline(sx0, sy0, sx1, sy1, shell_color, "inst_shell")
+        pos = _label_pos_for(shell_unions)
+        if pos is not None:
+            label_entries.append((shell_color, "shell", pos[0], pos[1]))
+
+    # -- Static: draw a DASHED outline (not solid like vFPGA/shell). Static
+    # is the pre-routed wrapper that CONTAINS shell + user regions, so a
+    # solid box would visually swallow the shell strips inside it. A dashed
+    # outline reads as "containing envelope" and stays distinguishable.
+    static_color = color_by_group.get("inst_static")
+    if static_color is not None and "inst_static" in group_bboxes:
+        gx0, gy0, gx1, gy1 = group_bboxes["inst_static"]
+        lines.append(
+            f'    <rect x="{_fmt(gx0)}" y="{_fmt(gy0)}" '
+            f'width="{_fmt(gx1 - gx0)}" height="{_fmt(gy1 - gy0)}" '
+            f'fill="none" stroke="{static_color}" stroke-width="3" '
+            f'stroke-dasharray="10 6" opacity="0.9" rx="3">'
+            f'<title>inst_static</title></rect>'
+        )
+        label_entries.append((static_color, "static", gx0, gy0))
+
+    # -- Hard-IP regions: no outline (they're scattered — HBM row + PCIe
+    # corner + NoC repeaters spread across the die, and any bbox is either
+    # a swarm of tiny per-tile rects or one mega-rect that misleads about
+    # ownership). The `hard-ip-tiles` background layer already shows the
+    # exact positions in olive/slate; just add a legend chip anchored to
+    # the largest tile cluster so the reader can bind color → name.
+    # Hard IP outlines: only the `hard` bucket gets outlined + labeled
+    # (covers PCIe + HBM + CMAC + ILKN + SYSMON + CONFIG). Big gap_x bridges
+    # the long HBM/CMAC row along the bottom of the die into one clean box;
+    # small gap_y keeps that row separate from mid-column CIPS/CONFIG tiles.
+    # Clusters with fewer than 5 tiles are dropped as noise (isolated
+    # CONFIG_SITE / SYSMONE4 singletons that don't merit their own outline).
+    # Transceivers (GTY) have their fill but no outline/label: the QSFP GT
+    # column is a single skinny vertical strip and its label just floats.
+    for res_key, res_label, anchor_pref in (
+        ("hard",        "hard IP", "largest"),
+    ):
+        pts = background_points.get(res_key, set())
+        if not pts:
+            continue
+        mw, mh = _MARK_SIZE[res_key]
+        hw = mw / 2.0
+        hh = mh / 2.0
+        tile_rects = [(p[0] - hw, p[1] - hh, p[0] + hw, p[1] + hh) for p in pts]
+        # Axis-aware gaps: large X to merge the long HBM/CMAC row across the
+        # die width, small Y to keep it separate from taller vertical strips.
+        sized_clusters = _cluster_rects_sized(tile_rects, gap_x=200.0, gap_y=25.0)
+        # Keep only significant clusters (≥5 tiles) so we don't outline every
+        # stray SYSMON/CONFIG singleton.
+        big_clusters = [c for c in sized_clusters if c[4] >= 5]
+        color = _RESOURCE_COLORS[res_key]
+        # HBM/CMAC/PCIe tiles form a single-tile-tall row along the die's
+        # bottom, giving a bbox only ~5 SVG px tall — invisible as a stroked
+        # outline. Pad each hard-IP cluster by 8 px in Y (a bit less in X)
+        # and clamp to the plot area so it reads as a proper region.
+        pad_x = 4.0
+        pad_y = 8.0
+        plot_x0, plot_y0 = left, top
+        plot_x1, plot_y1 = left + plot_width, top + plot_height
+        padded_bboxes: list[tuple[float, float, float, float]] = []
+        for bx0, by0, bx1, by1, _n in big_clusters:
+            px0 = max(plot_x0, bx0 - pad_x)
+            py0 = max(plot_y0, by0 - pad_y)
+            px1 = min(plot_x1, bx1 + pad_x)
+            py1 = min(plot_y1, by1 + pad_y)
+            padded_bboxes.append((px0, py0, px1, py1))
+            _draw_outline(px0, py0, px1, py1, color, res_label)
+        pos = _label_pos_for(padded_bboxes, prefer=anchor_pref)
+        if pos is not None:
+            label_entries.append((color, res_label, pos[0], pos[1]))
+
+    plot_right_edge = left + plot_width
+    for color, label, lx, ly in label_entries:
         text_w = LABEL_CHAR_W * len(label) + 2 * LABEL_PAD_X
-        lx = gx0 - pad
-        ly = gy0 - pad
+        # Clamp the chip so it doesn't overflow the plot rectangle on the
+        # right — anchor-at-bbox-top-left plus a wide chip could otherwise
+        # push the chip past plot_right (visible as a clipped label).
+        if lx + text_w > plot_right_edge:
+            lx = plot_right_edge - text_w
         collides = True
         while collides:
             collides = False
@@ -1034,6 +1313,12 @@ def _svg_document(
                     collides = True
                     break
         placed_labels.append((lx, ly, text_w, LABEL_H))
+        # Pick text color by chip-color luminance so labels on dark chips
+        # (e.g. shell #5a5040) don't become invisible near-black-on-near-black.
+        _hex = color.lstrip("#")
+        _r, _g, _b = int(_hex[0:2], 16), int(_hex[2:4], 16), int(_hex[4:6], 16)
+        _lum = 0.299 * _r + 0.587 * _g + 0.114 * _b
+        text_fill = "#111111" if _lum > 140 else "#ffffff"
         lines.append(
             f'    <rect x="{_fmt(lx)}" y="{_fmt(ly)}" width="{_fmt(text_w)}" '
             f'height="{_fmt(LABEL_H)}" fill="{color}" opacity="0.96" rx="4" '
@@ -1043,30 +1328,15 @@ def _svg_document(
             f'    <text x="{_fmt(lx + LABEL_PAD_X)}" '
             f'y="{_fmt(ly + LABEL_H - 10)}" '
             f'font-family="Inter, DejaVu Sans, sans-serif" '
-            f'font-size="{LABEL_FONT_SIZE}" font-weight="700" fill="#111111">'
+            f'font-size="{LABEL_FONT_SIZE}" font-weight="700" fill="{text_fill}">'
             f'{xml_escape(label)}</text>'
         )
     lines.append("  </g>")
 
-    if pblock_regions:
-        lines.append('  <g id="pblocks">')
-        for pblock, raw_regions, stroke in pblock_regions:
-            for region_index, (x0, y0, x1, y1) in enumerate(raw_regions):
-                px0 = left + (x0 - min_x) * scale - 4.0
-                px1 = left + (x1 - min_x) * scale + 4.0
-                py0 = top + (max_y - y1) * scale - 4.0
-                py1 = top + (max_y - y0) * scale + 4.0
-                lines.append(
-                    f'    <rect x="{_fmt(px0)}" y="{_fmt(py0)}" width="{_fmt(px1 - px0)}" '
-                    f'height="{_fmt(py1 - py0)}" fill="none" stroke="{stroke}" '
-                    'stroke-width="2" stroke-dasharray="8 5" opacity="0.9"/>'
-                )
-                if region_index == 0:
-                    lines.append(
-                        f'    <text class="pblock-label" x="{_fmt(px0 + 5)}" '
-                        f'y="{_fmt(py0 + 15)}">{xml_escape(pblock.name)}</text>'
-                    )
-        lines.append("  </g>")
+    # (Removed: dashed pblock-outline overlay + pblock_inst_* labels. The vFPGA
+    # colored bboxes above already convey the isolation regions; drawing another
+    # pass of dashed rects with pblock_inst_user_wrapper_N text made the figure
+    # noisy without adding information.)
 
     lines.extend(
         [
