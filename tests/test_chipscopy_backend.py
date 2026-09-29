@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import sys
@@ -147,9 +149,11 @@ class FakeIla:
             capture_state="idle",
             is_armed=False,
             is_full=True,
-            samples_captured=256,
-            windows_captured=2,
+            samples_captured=0,
+            windows_captured=1,
         )
+        self.waveform.window_size = 2048
+        self.waveform.trigger_position = [128]
         return self.status
 
     def upload(self) -> bool:
@@ -209,7 +213,10 @@ class FakeDevice:
             "serial": self.serial,
         }
 
-    def program(self, path: str) -> None:
+    def program(self, path: str, *, show_progress_bar: bool = True) -> None:
+        self.program_options = {"show_progress_bar": show_progress_bar}
+        if show_progress_bar:
+            print("Device program progress 100% Done")
         self.programmed = path
 
     def discover_and_setup_cores(self, ltx_file: str | None = None) -> None:
@@ -283,20 +290,41 @@ class ChipScoPyBackendTests(unittest.TestCase):
                 },
                 clear=True,
             ):
-                result = ChipScoPyBackend().program(str(pdi), None, "xcv80")
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    result = ChipScoPyBackend().program(str(pdi), None, "xcv80")
 
+        self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(self.device.programmed, str(pdi))
+        self.assertEqual(self.device.program_options, {"show_progress_bar": False})
         self.assertEqual(result["ltx"], None)
         self.assertEqual(result["bitstream_sha256"], hashlib.sha256(b"versal-pdi").hexdigest())
         self.assertEqual(result["provenance"]["selected_part"], self.device.part_name)
         self.assertEqual(result["provenance"]["selected_target"], result["target"])
         self.assertEqual(self.deleted, [self.session])
 
+    def test_program_vendor_progress_is_not_written_to_stdout(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            pdi = Path(td) / "design.pdi"
+            pdi.write_bytes(b"pdi")
+            stdout = io.StringIO()
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                contextlib.redirect_stdout(stdout),
+            ):
+                result = ChipScoPyBackend().program(str(pdi), None, "xcv80")
+
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertTrue(result["ok"])
+
     def test_ambiguous_part_match_fails_closed_and_closes_session(self) -> None:
         self.session.devices.append(FakeDevice(self.device.part_name, "SECOND-V80"))
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(XdbError, "ambiguous Versal target"):
-                ChipScoPyBackend().program("unused.pdi", None, "xcv80")
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    ChipScoPyBackend().program("unused.pdi", None, "xcv80")
+        self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(self.deleted, [self.session])
 
     def test_explicit_jtag_target_disambiguates_matching_parts(self) -> None:
@@ -409,6 +437,9 @@ class ChipScoPyBackendTests(unittest.TestCase):
                 armed = backend.arm_ila("xcv80", "ila0", 256, windows=2, trigger_position=32)
                 status = backend.ila_status("xcv80", "ila0")
                 waited = backend.wait_ila("xcv80", "ila0", timeout=60)
+                ila = next(iter(self.device.ila_cores))
+                ila.waveform.window_size = 256
+                ila.waveform.trigger_position = [32, 32]
                 uploaded = backend.upload_ila("xcv80", "ila0", str(csv))
             self.assertTrue(csv.is_file())
 
@@ -416,10 +447,14 @@ class ChipScoPyBackendTests(unittest.TestCase):
         self.assertEqual(armed["windows"], 2)
         self.assertTrue(status["status"]["is_armed"])
         self.assertTrue(waited["status"]["is_full"])
+        self.assertEqual(waited["status"]["samples_captured"], 2048)
+        self.assertEqual(waited["status"]["windows_captured"], 1)
         self.assertEqual(uploaded["samples"], 256)
         self.assertEqual(uploaded["windows"], 2)
         self.assertEqual(uploaded["total_samples"], 512)
         self.assertEqual(uploaded["trigger_position"], 32)
+        self.assertEqual(uploaded["trigger_positions"], [32, 32])
+        self.assertIsNone(uploaded["triggers"])
         self.assertEqual(len(self.created), 4)
         self.assertEqual(self.deleted, [self.session] * 4)
 
@@ -451,6 +486,8 @@ class ChipScoPyBackendTests(unittest.TestCase):
         self.assertNotIn("csv", result)
         self.assertEqual(manifest["schema"], "xdb.ila-waveform/v1")
         self.assertEqual(manifest["output_sha256"], result["output_sha256"])
+        self.assertEqual(result["trigger_positions"], [32, 32])
+        self.assertIsNone(result["triggers"])
         self.assertEqual(manifest["selection"]["include_gap"], True)
 
     def test_capture_exports_csv_and_closes_session(self) -> None:

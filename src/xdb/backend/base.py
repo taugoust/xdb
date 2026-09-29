@@ -129,8 +129,9 @@ class CaptureResult(ProvenanceResult, CaptureExportResult):
     samples: int
     windows: int
     total_samples: int
-    trigger_position: int
-    triggers: list[ProbeTrigger]
+    trigger_position: int | None
+    trigger_positions: list[int] | None
+    triggers: list[ProbeTrigger] | None
 
 
 class InstrumentInfo(TypedDict):

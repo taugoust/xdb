@@ -80,7 +80,7 @@ class ChipScoPyBackend:
         session = self._create_session(require_cs=False)
         try:
             dev = self._select_device(session, part_hint)
-            dev.program(bit)
+            dev.program(bit, show_progress_bar=False)
             target = self._target_name(dev)
             part = str(getattr(dev, "part_name", ""))
             return {
@@ -385,7 +385,27 @@ class ChipScoPyBackend:
         try:
             dev, ila = self._select_ila(session, part_hint, ila_name, ltx)
             status = ila.wait_till_done(max_wait_minutes=max(timeout, 1) / 60.0)
-            return self._ila_status_result(dev, ila, ila_name, status=status)
+            result = self._ila_status_result(dev, ila, ila_name, status=status)
+            # ChipScoPy can report zero samples after a full capture. The
+            # waveform is authoritative when available; otherwise retain its
+            # status value and do not invent a count.
+            status_result = result["status"]
+            if status_result.get("is_full"):
+                waveform = getattr(ila, "waveform", None)
+                window_size = getattr(waveform, "window_size", None)
+                window_count = getattr(waveform, "get_window_count", None)
+                if waveform is not None and callable(window_count):
+                    count_value = window_count()
+                    if isinstance(count_value, int):
+                        status_result["windows_captured"] = count_value
+                        if isinstance(window_size, int):
+                            status_result["samples_captured"] = window_size * count_value
+                else:
+                    requested = status_result.get("samples_requested")
+                    captured_windows = status_result.get("windows_captured")
+                    if isinstance(requested, int) and isinstance(captured_windows, int):
+                        status_result["samples_captured"] = requested * captured_windows
+            return result
         finally:
             self._delete_session(session)
 
@@ -436,8 +456,13 @@ class ChipScoPyBackend:
             )
             window_size = int(getattr(ila.waveform, "window_size", 0))
             captured_windows = int(ila.waveform.get_window_count())
-            trigger_positions = list(getattr(ila.waveform, "trigger_position", []))
-            trigger_position = int(trigger_positions[0]) if trigger_positions else 0
+            trigger_positions_value = getattr(ila.waveform, "trigger_position", None)
+            trigger_positions = (
+                [int(position) for position in trigger_positions_value]
+                if trigger_positions_value is not None
+                else None
+            )
+            trigger_position = trigger_positions[0] if trigger_positions else None
             result = self._capture_result(
                 dev,
                 ila_name,
@@ -445,7 +470,8 @@ class ChipScoPyBackend:
                 window_size,
                 captured_windows,
                 trigger_position,
-                [],
+                None,
+                trigger_positions=trigger_positions,
                 export_format=normalized_format,
             )
             manifest_path = out_path + ".json"
@@ -842,9 +868,10 @@ class ChipScoPyBackend:
         output_path: str,
         samples: int,
         windows: int,
-        trigger_position: int,
-        triggers: list[ProbeTrigger],
+        trigger_position: int | None,
+        triggers: list[ProbeTrigger] | None,
         *,
+        trigger_positions: list[int] | None = None,
         export_format: str = "CSV",
     ) -> CaptureResult:
         target = self._target_name(dev)
@@ -860,6 +887,7 @@ class ChipScoPyBackend:
             "windows": windows,
             "total_samples": samples * windows,
             "trigger_position": trigger_position,
+            "trigger_positions": trigger_positions,
             "triggers": triggers,
             "provenance": self._provenance(
                 require_cs=True, selected_target=target, selected_part=part
