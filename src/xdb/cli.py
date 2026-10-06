@@ -612,6 +612,12 @@ def main() -> None:  # pyright: ignore[reportGeneralTypeIssues]
     _configure_diagnostics(bool(args.debug))
 
     try:
+        if args.cmd == "docs":
+            from xdb.docs import run_docs
+
+            run_docs(args)
+            return
+
         if args.cmd == "_simd":
             run_daemon(
                 anchor_dir=args.anchor_dir,

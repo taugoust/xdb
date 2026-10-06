@@ -21,6 +21,37 @@ This repo provides a standalone CLI so ILA debug automation is not tied to any o
 - Headless, publication-ready SVG floorplans from routed Vivado checkpoints
 - Finite, packaged Vitis HLS C-simulation orchestration with provenance and bundles
 
+## AMD documentation
+
+Public AMD documentation is available without Vivado, an FPGA, or an AMD login:
+
+```bash
+xdb docs search 'CPM5 H2C FIFO' --per-page 5
+xdb docs search '"attr_dma_ch0_h2c_axi_dsc"' --page 1
+# Use mapId and contentId from a search result:
+xdb docs read MAP_ID CONTENT_ID
+xdb docs read MAP_ID CONTENT_ID --json
+xdb docs toc MAP_ID
+```
+
+Search and TOC return JSON. Search preserves the portal's metadata (including
+revision/document ID when supplied), source links, excerpts, and pagination.
+Results live under `response.results`; pagination is under `response.paging`.
+Queries are passed verbatim: broad multi-term searches may match loosely; retain
+literal double quotes for exact phrases. An empty result does not establish that
+a concept is undocumented. Read returns Markdown with source/revision information,
+or a JSON envelope containing the topic metadata and Markdown. TOC preserves the
+nested tree and content IDs. All outputs include a source URL and retrieval time.
+Check the returned revision against your tool/IP version; latest is not necessarily
+applicable. No version/product filtering is claimed in this initial integration.
+
+These commands use the Fluid Topics Knowledge Hub API exposed by `docs.amd.com`,
+not an AMD-guaranteed developer API. They send `Ft-Calling-App: xdb`, perform no
+automatic retries, and accept `--timeout SECONDS` (default 30 per request). Responses
+are limited to 16 MiB. API changes, access denial and rate limiting are reported
+as errors. Authentication, browser sessions, local PDF indexing and downloads are
+not implemented; xdb does not load credentials or cookies or follow redirects.
+
 ## Requirements
 
 - Python 3.10+

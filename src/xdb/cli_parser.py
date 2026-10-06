@@ -4,6 +4,7 @@ import argparse
 import os
 
 from xdb import __version__
+from xdb.docs import add_docs_parser
 
 
 def _add_debug_flag(parser: argparse.ArgumentParser) -> None:
@@ -34,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
         "vivado",
         "instruments",
         "hls",
+        "docs",
         "sim",
     ]
     sub = p.add_subparsers(
@@ -41,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="{" + ",".join(visible_commands) + "}",
     )
+
+    add_docs_parser(sub)
 
     s_targets = sub.add_parser("targets")
     _add_debug_flag(s_targets)
