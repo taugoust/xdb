@@ -67,6 +67,22 @@ are limited to 16 MiB. API changes, access denial and rate limiting are reported
 as errors. Authentication, browser sessions, local PDF indexing and downloads are
 not implemented; xdb does not load credentials or cookies or follow redirects.
 
+### HTML-only topics and support articles
+
+Some valid topics return HTTP 404 for Markdown while their HTML content remains
+publicly readable. `docs read` retries the plain content endpoint only after
+Markdown HTTP 404/406/415 and converts the topic fragment into readable Markdown,
+retaining links and simple tables. JSON retains `markdown` and adds `source_format`,
+`content_url`, and `markdown_fallback_status`; text output identifies the fallback.
+The converter is intentionally basic, not a lossless HTML renderer. Full HTML
+portal pages and empty HTML content are rejected rather than presented as articles.
+Authentication failures, rate limits and server errors do not trigger fallback.
+
+Answer Record links may point to the separate Salesforce-based
+`adaptivesupport.amd.com` site. That site can return an application shell without
+article content even with HTTP 200. This fallback does not retrieve those articles
+or imply that login is required; their links are preserved for further research.
+
 ## Requirements
 
 - Python 3.10+

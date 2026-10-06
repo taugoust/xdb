@@ -13,6 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from xdb.errors import XdbError
+from xdb.docs_html import topic_html_to_markdown
 
 BASE_URL = "https://docs.amd.com/api/khub"
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -20,6 +21,12 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 
 class DocsError(XdbError):
     """A documentation request could not be completed safely."""
+
+
+class _DocsHTTPError(DocsError):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -89,10 +96,19 @@ class AmdDocs:
         self.timeout = timeout
         self.opener = build_opener(_NoRedirect())
 
-    def _request(self, path: str, *, body: dict | None = None, markdown: bool = False):
+    def _request(
+        self,
+        path: str,
+        *,
+        body: dict | None = None,
+        markdown: bool = False,
+        html_content: bool = False,
+    ):
         headers = {
             "Ft-Calling-App": "xdb",
-            "Accept": "text/markdown" if markdown else "application/json",
+            "Accept": "text/html"
+            if html_content
+            else ("text/markdown" if markdown else "application/json"),
         }
         data = None if body is None else json.dumps(body).encode("utf-8")
         if body is not None:
@@ -100,7 +116,11 @@ class AmdDocs:
         request = Request(BASE_URL + path, data=data, headers=headers)
         try:
             with self.opener.open(request, timeout=self.timeout) as response:
-                expected = "text/markdown" if markdown else "application/json"
+                expected = (
+                    "text/html"
+                    if html_content
+                    else ("text/markdown" if markdown else "application/json")
+                )
                 if response.headers.get_content_type() != expected:
                     raise DocsError(
                         f"AMD returned unexpected content (expected {expected}); portal/API may have changed"
@@ -109,7 +129,7 @@ class AmdDocs:
                 if len(raw) > MAX_RESPONSE_BYTES:
                     raise DocsError("AMD response exceeds the 16 MiB limit; narrow the request")
                 text = raw.decode("utf-8")
-                return text if markdown else json.loads(text)
+                return text if markdown or html_content else json.loads(text)
         except HTTPError as exc:
             if exc.code in (401, 403):
                 detail = "access denied; only anonymous public documentation is supported"
@@ -119,7 +139,7 @@ class AmdDocs:
                 detail = "rate limited; wait before retrying"
             else:
                 detail = "request failed (redirects are not followed)"
-            raise DocsError(f"AMD documentation HTTP {exc.code}: {detail}") from exc
+            raise _DocsHTTPError(exc.code, f"AMD documentation HTTP {exc.code}: {detail}") from exc
         except (URLError, OSError) as exc:
             raise DocsError(f"AMD documentation connection failed: {exc}") from exc
         except (UnicodeError, json.JSONDecodeError) as exc:
@@ -191,9 +211,28 @@ class AmdDocs:
         topic = self._request(path)
         if not isinstance(topic, dict) or not isinstance(topic.get("metadata"), list):
             raise DocsError("unexpected AMD topic response schema")
-        markdown = self._request(path + "/content?format=markdown", markdown=True)
+        content_path = path + "/content?format=markdown"
+        source_format = "markdown"
+        fallback_status = None
+        try:
+            markdown = self._request(content_path, markdown=True)
+        except _DocsHTTPError as exc:
+            if exc.status not in {404, 406, 415}:
+                raise
+            fallback_status = exc.status
+            content_path = path + "/content"
+            source_format = "html"
+            content = self._request(content_path, html_content=True)
+            markdown = topic_html_to_markdown(content, BASE_URL + content_path)
         return self._envelope(
-            path, map_id=map_id, topic_id=topic_id, topic=topic, markdown=markdown
+            path,
+            map_id=map_id,
+            topic_id=topic_id,
+            topic=topic,
+            markdown=markdown,
+            content_url=BASE_URL + content_path,
+            source_format=source_format,
+            markdown_fallback_status=fallback_status,
         )
 
     def toc(self, map_id: str) -> dict:
@@ -380,6 +419,10 @@ def run_docs(args) -> None:
         result = client.read(args.map_id, args.topic_id)
         if not args.json:
             print(f"Source: {result['source_url']}\nRetrieved: {result['retrieved_at']}")
+            if result.get("source_format") == "html":
+                print(
+                    f"Format: converted from HTML (Markdown HTTP {result['markdown_fallback_status']})"
+                )
             for item in result["topic"]["metadata"]:
                 if item.get("key") in {
                     "Document_ID",
