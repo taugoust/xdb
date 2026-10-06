@@ -28,22 +28,37 @@ Public AMD documentation is available without Vivado, an FPGA, or an AMD login:
 ```bash
 xdb docs search 'CPM5 H2C FIFO' --per-page 5
 xdb docs search '"attr_dma_ch0_h2c_axi_dsc"' --page 1
+xdb docs search reset --document-id PG347 --product cpm-dma-bridge --version '3.0 English'
+xdb docs maps PG347
+xdb docs toc MAP_ID --filter "AXI"
+xdb docs toc MAP_ID --filter "AXI" --offset 20 --limit 20
 # Use mapId and contentId from a search result:
 xdb docs read MAP_ID CONTENT_ID
 xdb docs read MAP_ID CONTENT_ID --json
 xdb docs toc MAP_ID
 ```
 
-Search and TOC return JSON. Search preserves the portal's metadata (including
-revision/document ID when supplied), source links, excerpts, and pagination.
-Results live under `response.results`; pagination is under `response.paging`.
+Search defaults to compact, copyable results with title, Document_ID, version,
+breadcrumb, excerpt, URL, and `xdb docs read MAP_ID CONTENT_ID` command. It shows
+total results, current page, and a copyable next-page command. `--json` retains the
+full source/retrieval/request/response metadata envelope. Server-side
+`--document-id`, `--product`, and `--version` use verified Fluid Topics facets;
+Publication-ID scoping is intentionally not offered because live controls showed
+the API ignored that key. `xdb docs maps QUERY` discovers candidate maps with Document_ID, revision/version,
+and product values plus a direct `xdb docs toc MAP_ID` command. `xdb docs toc
+MAP_ID` prints a bounded page of topics; `--filter TEXT` matches titles while
+retaining full ancestor breadcrumbs, and `--offset`/`--limit` paginate matches.
+Use `--json` for the complete TOC tree.
+
 Queries are passed verbatim: broad multi-term searches may match loosely; retain
 literal double quotes for exact phrases. An empty result does not establish that
-a concept is undocumented. Read returns Markdown with source/revision information,
-or a JSON envelope containing the topic metadata and Markdown. TOC preserves the
-nested tree and content IDs. All outputs include a source URL and retrieval time.
-Check the returned revision against your tool/IP version; latest is not necessarily
-applicable. No version/product filtering is claimed in this initial integration.
+a concept is undocumented or restricted. Read returns Markdown with source/revision
+information, or a JSON envelope containing topic metadata and Markdown. Check the
+returned revision against your tool/IP version; latest is not necessarily applicable.
+For iterative research, start with `maps` to identify the right document, search
+within its Document_ID/Product/version, inspect neighboring TOC entries, then read
+the topic and use `--page`/the printed Next command for more matches. A missing
+search result is not proof of access restriction or absence.
 
 These commands use the Fluid Topics Knowledge Hub API exposed by `docs.amd.com`,
 not an AMD-guaranteed developer API. They send `Ft-Calling-App: xdb`, perform no

@@ -10,7 +10,7 @@ from urllib.error import HTTPError, URLError
 
 from xdb.cli import main
 from xdb.cli_parser import build_parser
-from xdb.docs import AmdDocs, DocsError, _NoRedirect
+from xdb.docs import AmdDocs, DocsError, _NoRedirect, _render_maps, _render_search, _render_toc
 
 
 def response(payload, content_type="application/json"):
@@ -50,6 +50,107 @@ class DocsTest(unittest.TestCase):
         )
         self.assertEqual(result["response"], payload)
         self.assertIn("retrieved_at", result)
+
+    def test_facet_filters_are_server_side_array(self):
+        self.client.opener.open.return_value = response(
+            {"results": [], "paging": {"currentPage": 1}}
+        )
+        self.client.search(
+            "reset", document_id="PG347", product="cpm-dma-bridge", version="3.0 English"
+        )
+        body = json.loads(self.client.opener.open.call_args.args[0].data)
+        self.assertEqual(body["query"], "reset")
+        self.assertEqual(
+            body["filters"],
+            [
+                {"key": "Document_ID", "values": ["PG347"]},
+                {"key": "Product", "values": ["cpm-dma-bridge"]},
+                {"key": "Doc_Version", "values": ["3.0 English"]},
+            ],
+        )
+
+    def test_search_renderer_unescapes_quotes_and_next_page_command(self):
+        output = io.StringIO()
+        item = {
+            "htmlTitle": "<b>A &amp; B</b>",
+            "htmlExcerpt": "Use &quot;x y&quot;",
+            "mapId": "m",
+            "contentId": "t",
+            "topicUrl": "https://docs/topic",
+            "occurrences": [{"breadcrumb": ["Parent", "Child"]}],
+            "metadata": [
+                {"key": "Document_ID", "values": ["PG347"]},
+                {"key": "Doc_Version", "values": ["3.0"]},
+            ],
+        }
+        with redirect_stdout(output):
+            _render_search(
+                {
+                    "request": {
+                        "query": "x y",
+                        "paging": {"perPage": 5},
+                        "filters": [{"key": "Product", "values": ["x y"]}],
+                    },
+                    "response": {
+                        "paging": {"currentPage": 1, "totalResultsCount": 9, "isLastPage": False},
+                        "results": [item | {"occurrences": []}],
+                    },
+                },
+                locale="fr-FR",
+                timeout=12.5,
+            )
+        text = output.getvalue()
+        self.assertIn("A & B — PG347 rev 3.0", text)
+        self.assertIn('Use "x y"', text)
+        self.assertNotIn("Parent > Child", text)
+        self.assertNotIn("Traceback", text)
+        self.assertIn("--page 2", text)
+        self.assertIn("'x y'", text)
+        self.assertIn("xdb docs read m t", text)
+        self.assertIn("--locale fr-FR", text)
+        self.assertIn("--timeout 12.5", text)
+        self.assertIn("--product 'x y'", text)
+
+    def test_toc_is_bounded_and_keeps_ancestor(self):
+        output = io.StringIO()
+        tree = [
+            {
+                "title": "Parent",
+                "contentId": "p",
+                "children": [{"title": f"Child {n}", "contentId": f"c{n}"} for n in range(5)],
+            }
+        ]
+        with redirect_stdout(output):
+            _render_toc(tree, "map", query="child", limit=2, offset=1)
+        self.assertIn("Parent > Child 1", output.getvalue())
+        self.assertIn("Next:", output.getvalue())
+        self.assertEqual(output.getvalue().count("xdb docs read"), 2)
+
+    def test_maps_render_document_version_product_and_direct_toc(self):
+        output = io.StringIO()
+        payload = {
+            "response": {
+                "paging": {"currentPage": 1, "totalResultsCount": 1},
+                "results": [
+                    {
+                        "mapId": "map",
+                        "title": "Guide",
+                        "metadata": [
+                            {"key": "Document_ID", "values": ["PG347"]},
+                            {"key": "Doc_Version", "values": ["3.0 English"]},
+                            {"key": "Product", "values": ["CPM"]},
+                        ],
+                    }
+                ],
+            }
+        }
+        with redirect_stdout(output):
+            _render_maps(payload, "PG347")
+        text = output.getvalue()
+        self.assertIn("PG347", text)
+        self.assertIn("3.0 English", text)
+        self.assertIn("CPM", text)
+        self.assertIn("xdb docs toc map", text)
 
     def test_empty_search_accepts_zero_current_page(self):
         self.client.opener.open.return_value = response(
@@ -127,8 +228,8 @@ class DocsTest(unittest.TestCase):
 
     def test_cli_routes_without_hardware(self):
         cases = [
-            (["search", "CPM5"], "search", {"response": {"results": []}}),
-            (["toc", "map"], "toc", {"topics": []}),
+            (["search", "CPM5", "--json"], "search", {"response": {"results": []}}),
+            (["toc", "map", "--json"], "toc", {"topics": []}),
             (["read", "map", "topic", "--json"], "read", {"markdown": "# Topic"}),
         ]
         for args, method, payload in cases:
