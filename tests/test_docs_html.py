@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 from urllib.error import HTTPError
 
 from xdb.docs import AmdDocs, DocsError
-from xdb.docs_html import topic_html_to_markdown
+from xdb.docs_html import topic_html_links, topic_html_to_markdown
 from xdb.errors import XdbError
 
 
@@ -18,6 +18,14 @@ def reply(text, mime):
 
 
 class DocsHtmlTests(unittest.TestCase):
+    def test_link_extraction_relative_dedup_hidden_and_unsafe(self):
+        source = '<div><p><a href="../guide#part">A &amp; B</a><a href="../guide#part">A &amp; B</a><script><a href="https://evil">hidden</a></script><nav><a href="https://evil">nav</a></nav><a href="javascript:bad">bad</a><table><tr><td><a href="https://adaptivesupport.amd.com/s/article/id">AR</a></td></tr></table></div>'
+        links = topic_html_links(source, "https://docs.amd.com/content/topic")
+        self.assertEqual(links, [
+            {"text": "A & B", "url": "https://docs.amd.com/guide#part", "kind": "public-doc"},
+            {"text": "AR", "url": "https://adaptivesupport.amd.com/s/article/id", "kind": "external-support"},
+        ])
+
     def test_realistic_known_issues_fragment(self):
         fragment = '<div class="body conbody"><p><span>Vivado Design Suite</span> Tools Known Issues can be found at Answer Record <a href="https://adaptivesupport.amd.com/s/article/000037546?language=en_US">000037546</a>.</p></div>'
         text = topic_html_to_markdown(fragment, "https://docs.amd.com/content")

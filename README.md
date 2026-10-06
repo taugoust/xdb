@@ -35,6 +35,8 @@ xdb docs toc MAP_ID --filter "AXI" --offset 20 --limit 20
 # Use mapId and contentId from a search result:
 xdb docs read MAP_ID CONTENT_ID
 xdb docs read MAP_ID CONTENT_ID --json
+xdb docs refs MAP_ID CONTENT_ID
+xdb docs refs MAP_ID CONTENT_ID --json
 xdb docs toc MAP_ID
 ```
 
@@ -45,7 +47,7 @@ full source/retrieval/request/response metadata envelope. Server-side
 `--document-id`, `--product`, and `--version` use verified Fluid Topics facets;
 Publication-ID scoping is intentionally not offered because live controls showed
 the API ignored that key. `xdb docs maps QUERY` discovers candidate maps with Document_ID, revision/version,
-and product values plus a direct `xdb docs toc MAP_ID` command. `xdb docs toc
+and product values plus a direct `xdb docs toc MAP_ID` command. `xdb docs refs MAP_ID TOPIC_ID` lists topic hyperlinks and destinations with provenance, without fetching destinations. `xdb docs toc
 MAP_ID` prints a bounded page of topics; `--filter TEXT` matches titles while
 retaining full ancestor breadcrumbs, and `--offset`/`--limit` paginate matches.
 Use `--json` for the complete TOC tree.
@@ -66,6 +68,8 @@ automatic retries, and accept `--timeout SECONDS` (default 30 per request). Resp
 are limited to 16 MiB. API changes, access denial and rate limiting are reported
 as errors. Authentication, browser sessions, local PDF indexing and downloads are
 not implemented; xdb does not load credentials or cookies or follow redirects.
+
+See [the source-coverage workflow](docs/source-coverage.md) for an evidence-based checklist across manuals, known issues, errata, and examples.
 
 ### HTML-only topics and support articles
 

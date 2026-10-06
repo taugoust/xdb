@@ -13,6 +13,8 @@ class _TopicText(HTMLParser):
         self.parts: list[str] = []
         self.hidden: list[str] = []
         self.links: list[str] = []
+        self.ref_items: list[dict] = []
+        self.anchor_text: list[str] = []
         self.table = False
         self.row: list[str] | None = None
         self.cell: list[str] | None = None
@@ -34,6 +36,7 @@ class _TopicText(HTMLParser):
             target = urljoin(self.source_url, href)
             safe = urlsplit(target).scheme in {"https", "http"} and bool(href)
             self.links.append(target if safe else "")
+            self.anchor_text.append("")
             if safe:
                 self.emit("[")
         elif tag == "table":
@@ -59,7 +62,9 @@ class _TopicText(HTMLParser):
             return
         if tag == "a" and self.links:
             target = self.links.pop()
+            label = self.anchor_text.pop() if self.anchor_text else ""
             if target:
+                self.ref_items.append({"text": " ".join(label.split()), "url": target})
                 # Angle brackets keep parentheses/spaces in URLs from breaking links.
                 target = target.replace("<", "%3C").replace(">", "%3E").replace("\n", "")
                 self.emit(f"](<{target}>)")
@@ -98,6 +103,34 @@ class _TopicText(HTMLParser):
             if self.table and self.cell is None and not data.strip():
                 return
             self.emit(data)
+            if self.anchor_text:
+                self.anchor_text[-1] += data
+
+
+def topic_html_links(source: str, source_url: str) -> list[dict]:
+    parser = _TopicText(source_url)
+    parser.feed(source)
+    parser.close()
+    if parser.full_page:
+        raise XdbError("AMD returned a portal page rather than a topic fragment")
+    unique = []
+    seen = set()
+    for item in parser.ref_items:
+        item = {key: "".join(c for c in value if c.isprintable()) for key, value in item.items()}
+        key = (item["url"], item["text"])
+        if key in seen:
+            continue
+        seen.add(key)
+        host = urlsplit(item["url"]).hostname or ""
+        item["kind"] = (
+            "public-doc"
+            if host == "docs.amd.com"
+            else "external-support"
+            if host == "adaptivesupport.amd.com"
+            else "external"
+        )
+        unique.append(item)
+    return unique
 
 
 def topic_html_to_markdown(source: str, source_url: str) -> str:

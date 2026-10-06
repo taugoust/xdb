@@ -71,6 +71,10 @@ def add_docs_parser(subparsers) -> None:
     maps.add_argument("--page", type=_positive_int, default=1)
     maps.add_argument("--per-page", type=_positive_int, default=10)
     maps.add_argument("--json", action="store_true", help="emit the complete metadata envelope")
+    refs = commands.add_parser("refs", help="list links embedded in a topic")
+    refs.add_argument("map_id")
+    refs.add_argument("topic_id")
+    refs.add_argument("--json", action="store_true", help="emit references as JSON")
     read = commands.add_parser("read", help="read a topic as Markdown with provenance")
     read.add_argument("map_id")
     read.add_argument("topic_id")
@@ -83,7 +87,7 @@ def add_docs_parser(subparsers) -> None:
     )
     toc.add_argument("--offset", type=int, default=0, help="skip this many matching topics")
     toc.add_argument("--json", action="store_true", help="emit the complete metadata envelope/tree")
-    for command in (search, maps, read, toc):
+    for command in (search, maps, read, refs, toc):
         command.add_argument(
             "--timeout", type=_timeout, default=30.0, help="per-request timeout in seconds"
         )
@@ -233,6 +237,25 @@ class AmdDocs:
             content_url=BASE_URL + content_path,
             source_format=source_format,
             markdown_fallback_status=fallback_status,
+        )
+
+    def refs(self, map_id: str, topic_id: str) -> dict:
+        path = f"/maps/{_identifier(map_id)}/topics/{_identifier(topic_id)}"
+        topic = self._request(path)
+        if not isinstance(topic, dict) or not isinstance(topic.get("metadata"), list):
+            raise DocsError("unexpected AMD topic response schema")
+        from xdb.docs_html import topic_html_links
+
+        content_path = path + "/content"
+        content = self._request(content_path, html_content=True)
+        links = topic_html_links(content, BASE_URL + content_path)
+        return self._envelope(
+            path,
+            map_id=map_id,
+            topic_id=topic_id,
+            topic=topic,
+            content_url=BASE_URL + content_path,
+            links=links,
         )
 
     def toc(self, map_id: str) -> dict:
@@ -414,6 +437,16 @@ def run_docs(args) -> None:
                 limit=args.limit,
                 offset=args.offset,
             )
+            return
+    elif args.docs_cmd == "refs":
+        result = client.refs(args.map_id, args.topic_id)
+        if not args.json:
+            print(f"Source: {result['source_url']}\nContent: {result['content_url']}")
+            for item in result["topic"]["metadata"]:
+                if item.get("key") in {"Document_ID", "Revision", "Doc_Version", "ft:prettyUrl"}:
+                    print(f"{item['key']}: {', '.join(item.get('values', []))}")
+            for link in result["links"]:
+                print(f"{link['text']} — {link['url']} [{link['kind']}]")
             return
     else:
         result = client.read(args.map_id, args.topic_id)
